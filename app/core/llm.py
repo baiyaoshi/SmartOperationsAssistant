@@ -15,6 +15,6 @@ async def main():
         model="qwen-plus",
         messages=[{"role": "user", "content": "你好"}]
     )
-    print(resp.choices[0].message.content)
+    #print(resp.choices[0].message.content)
 
 asyncio.run(main())

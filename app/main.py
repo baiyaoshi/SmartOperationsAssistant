@@ -4,7 +4,7 @@ import json
 from pydantic import BaseModel
 from app.core.llm import client
 from app.tools.meta import tool_registry
-
+from fastapi.responses import StreamingResponse
 
 app=FastAPI(title="Smart Operations Assistant")
 
@@ -55,5 +55,29 @@ async def chat(request:ChatRequest):
         )
         return {"reply": second_resp.choices[0].message.content}
     return msg.content
+
+
+async def stream_response(message: str):
+    stream = await client.chat.completions.create(
+        model="qwen3.5-plus",
+        messages=[{"role": "user", "content": message}],
+        stream=True
+    )
+
+    async for chunk in stream:
+        if not chunk.choices:
+            continue
+        if chunk.choices[0].delta.content:
+            yield f"data: {chunk.choices[0].delta.content}\n\n"
+
+    yield "data: [DONE]\n\n"
+
+@app.post("/api/v1/chat/stream")
+async def chat_stream(request:ChatRequest):
+    return StreamingResponse(
+        stream_response(request.message),
+        media_type="text/event-stream"
+    )
+
 if __name__ == "__main__":
     uvicorn.run(app, host="localhost", port=9900)
