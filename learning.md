@@ -635,3 +635,281 @@ async def graph_demo(request: ChatRequest):
 ```
 
 **`ainvoke()` 的参数就是state的初始状态。**
+
+
+
+### 简单的langraph节点，包含skillrouter,executor,replanner等
+
+```py
+"""LangGraph Plan-Execute-Replan 演示"""
+
+from typing import TypedDict, List
+from langgraph.graph import StateGraph, START, END
+from app.core.llm import client
+
+
+class PlanExecuteState(TypedDict):
+    input: str  # 用户原始问题
+    selected_skill: str  # 选中的技能
+    plan: List[str]  # 待执行的步骤列表
+    past_steps: List[str]  # 已执行的步骤描述
+    current_step: str  # 当前步骤
+    current_result: str  # 当前步骤的结果
+    response: str  # 最终报告
+    step_index: int  # 当前步数
+    is_finished: bool  # 是否完成
+
+
+async def skill_router(state:PlanExecuteState)->dict:
+    """判断用户提出问题属于哪一个诊断领域"""
+    prompt = f"""用户问题: {state['input']}
+    请判断这是哪类问题, 从以下选项中选择一个:
+    - host_resource: CPU/内存/磁盘/本机卡顿
+    - network: ping/HTTP/DNS/端口/网址打不开
+    - generic: 其他无法归类的故障
+    只返回选项名称, 不要其他文字。"""
+    resp=await client.chat.completions.create(
+        model="qwen-plus",
+        messages=[{"role":"user","content":prompt}]
+    )
+    skill=resp.choices[0].message.content.strip()
+    print(f"选择了Skill：{skill}")
+    return {"selected_skill":skill}
+
+
+#节点Planner（制定计划）
+async def planner(state: PlanExecuteState) -> dict:
+    """把用户问题拆成 2-3 个诊断步骤"""
+    prompt = f"""用户问题: {state['input']}
+                请把这个问题拆成 2-3 个诊断步骤，每步一句话。
+                只返回步骤列表，每行一个，不要序号。"""
+
+    resp = await client.chat.completions.create(
+        model="qwen-plus",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    steps = resp.choices[0].message.content.strip().split("\n")
+    print(f"计划: {steps}")
+    return {"plan": steps, "step_index": 0, "is_finished": False}
+
+
+#节点Executor（执行一步）
+async def executor(state: PlanExecuteState) -> dict:
+    """执行当前步骤"""
+    idx = state["step_index"]
+    step = state["plan"][idx]
+    print(f"🔧 执行第 {idx + 1} 步: {step}")
+
+    #简单模拟让LLM回答这一步
+    resp = await client.chat.completions.create(
+        model="qwen-plus",
+        messages=[{"role": "user", "content": f"请回答这个问题（模拟诊断工具）: {step}"}]
+    )
+    result = resp.choices[0].message.content
+
+    # 打开state 拼接过去完成步骤 拼接前50作为摘要后续我可能会进行修改
+    new_past_steps = state.get("past_steps", []) + [f"{step} → {result[:50]}..."]
+    return {
+        "current_step": step,
+        "current_result": result,
+        "past_steps": new_past_steps,
+        "step_index": idx + 1
+    }
+
+
+#节点Replanner（评估进度）
+async def replanner(state: PlanExecuteState) -> dict:
+    """判断是否完成"""
+    idx = state["step_index"]
+    total = len(state["plan"])
+
+    if idx >= total:
+        # 所有步骤执行完毕，生成报告
+        prompt = f"""用户问题: {state['input']}
+                诊断记录: {state['past_steps']}
+                请生成一份完整的诊断报告。"""
+        resp = await client.chat.completions.create(
+            model="qwen-plus",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        report = resp.choices[0].message.content
+        print(f" 报告生成完成")
+        return {"response": report, "is_finished": True}
+    else:
+        print(f" 还有 {total - idx} 步未执行，继续")
+        return {"is_finished": False}
+
+
+#条件边: 判断是否继续
+def should_continue(state: PlanExecuteState) -> str:
+    if state["is_finished"]:
+        return "end"
+    else:
+        return "continue"
+
+
+#建图
+def build_graph():
+    builder = StateGraph(PlanExecuteState)
+    builder.add_node("skill_router",skill_router)
+    builder.add_node("planner", planner)
+    builder.add_node("executor", executor)
+    builder.add_node("replanner", replanner)
+
+    builder.add_edge(START, "skill_router")
+    builder.add_edge("skill_router","planner")
+    builder.add_edge("planner", "executor")
+    builder.add_edge("executor", "replanner")
+    builder.add_conditional_edges(
+        "replanner",
+        should_continue,
+        {
+            "continue": "executor",  # 还有步骤 → 继续执行
+            "end": END  # 完成 → 结束
+        }
+    )
+
+    return builder.compile()
+```
+
+### 在节点中调用工具
+
+```py
+async def executor(state: PlanExecuteState) -> dict:
+    """执行当前步骤"""
+    idx = state["step_index"]
+    step = state["plan"][idx]
+    print(f" 执行第 {idx + 1} 步: {step}")
+
+    #第一次调用，让llm决定是否要调用工具
+    resp = await client.chat.completions.create(
+        model="qwen-plus",
+        messages=[{"role": "user", "content": step}],
+        tools=[info["definition"] for info in tool_registry.values()]
+    )
+    msg=resp.choices[0].message
+    #如果决定调用工具
+    if msg.tool_calls:
+        tool_results=[]
+        for tool_call in msg.tool_calls:
+            tool_name=tool_call.function.name
+            tool_info=tool_registry[tool_name]
+            arguments=json.loads(tool_call.function.arguments)
+            result=tool_info["function"](**arguments)
+            tool_results.append({
+                "role":"tool",
+                "tool_call_id":tool_call.id,
+                "content":result
+            })
+        #第二次调用，工具调用结果交给LLM
+        second_resp=await client.chat.completions.create(
+            model="qwen-plus",
+            messages=[
+                {"role":"user","content":step},
+                msg,
+                *tool_results
+            ]
+        )
+        result=second_resp.choices[0].message.content
+    else:
+        result=msg.content
+
+    # 打开state 拼接过去完成步骤 拼接前50作为摘要后续我可能会进行修改
+    new_past_steps = state.get("past_steps", []) + [f"{step} → {result[:50]}..."]
+    return {
+        "current_step": step,
+        "current_result": result,
+        "past_steps": new_past_steps,
+        "step_index": idx + 1
+    }
+```
+
+
+
+**工具是怎么调用的，arguments又是什么语法，我完全没看到工具调用的函数**？
+
+A:
+
+```python
+for tool_call in msg.tool_calls:
+    tool_name = tool_call.function.name        # 工具名（字符串）
+    tool_info = tool_registry[tool_name]       # 从注册表取 {function, definition}
+    arguments = json.loads(tool_call.function.arguments)  # ← 你问的这行
+    result = tool_info["function"](**arguments)  # ← 真正调用工具的地方
+```
+
+拆开来看
+
+1. `msg.tool_calls` 是什么？
+
+当 LLM 决定调工具时，它返回的 `msg.tool_calls` 是一个列表，比如：
+
+```python
+[
+    ToolCall(
+        id="call_123",
+        function=Function(
+            name="get_current_time",           # 工具名
+            arguments='{}'                      # 参数（JSON 字符串）
+        )
+    ),
+    ToolCall(
+        id="call_456",
+        function=Function(
+            name="get_weather",
+            arguments='{"city": "北京"}'         # 参数
+        )
+    )
+]
+```
+
+2. `json.loads(tool_call.function.arguments)`
+
+LLM 返回的 `arguments` 是 **JSON 格式的字符串**，比如 `'{"city": "北京"}'`。
+
+```
+json.loads()` 把它解析成 Python 字典：`{"city": "北京"}
+```
+
+3. `tool_info["function"](**arguments)` ← **真正调用的地方**
+
+`tool_info` 是从注册表里取出来的
+
+```python
+{
+    "function": get_weather,        # ← 这是真正的 Python 函数
+    "definition": weather_tool_definition  # ← 这是给 LLM 看的 JSON 描述
+}
+```
+
+所以 `tool_info["function"]` 就是 `get_weather` 这个函数。
+
+`**arguments` 是 Python 的**解包语法**，把字典展开成关键字参数：
+
+```python
+# 如果 arguments = {"city": "北京"}
+# 那么：
+tool_info["function"](**arguments)
+# 等价于：
+get_weather(city="北京")
+```
+
+总结
+
+| 代码                               | 含义                                      |
+| ---------------------------------- | ----------------------------------------- |
+| tool_call.function.name            | LLM 说"我要调 get_weather"                |
+| tool_registry["get_weather"]       | 从注册表找到对应的函数和定义              |
+| tool_call.function.arguments       | LLM 给的参数，是 JSON 字符串              |
+| json.loads(...)                    | 把 '{"city":"北京"}' 变成 {"city":"北京"} |
+| tool_info["function"](**arguments) | 真正执行 get_weather(city="北京")         |
+
+所以整条链路是：
+
+```
+LLM 说"调 get_weather，参数 city=北京"
+  → 解析出函数名和参数
+  → 从注册表找到 get_weather 这个 Python 函数
+  → 用 **arguments 把参数传进去
+  → 函数执行，返回结果
+```

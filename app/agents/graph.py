@@ -1,8 +1,11 @@
 """LangGraph Plan-Execute-Replan 演示"""
 
 from typing import TypedDict, List
+import json
+from click import argument
 from langgraph.graph import StateGraph, START, END
 from app.core.llm import client
+from app.tools.meta import tool_registry
 
 
 class PlanExecuteState(TypedDict):
@@ -55,14 +58,40 @@ async def executor(state: PlanExecuteState) -> dict:
     """执行当前步骤"""
     idx = state["step_index"]
     step = state["plan"][idx]
-    print(f"🔧 执行第 {idx + 1} 步: {step}")
+    print(f" 执行第 {idx + 1} 步: {step}")
 
-    #简单模拟让LLM回答这一步
+    #第一次调用，让llm决定是否要调用工具
     resp = await client.chat.completions.create(
         model="qwen-plus",
-        messages=[{"role": "user", "content": f"请回答这个问题（模拟诊断工具）: {step}"}]
+        messages=[{"role": "user", "content": step}],
+        tools=[info["definition"] for info in tool_registry.values()]
     )
-    result = resp.choices[0].message.content
+    msg=resp.choices[0].message
+    #如果决定调用工具
+    if msg.tool_calls:
+        tool_results=[]
+        for tool_call in msg.tool_calls:
+            tool_name=tool_call.function.name
+            tool_info=tool_registry[tool_name]
+            arguments=json.loads(tool_call.function.arguments)
+            result=tool_info["function"](**arguments)
+            tool_results.append({
+                "role":"tool",
+                "tool_call_id":tool_call.id,
+                "content":result
+            })
+        #第二次调用，工具调用结果交给LLM
+        second_resp=await client.chat.completions.create(
+            model="qwen-plus",
+            messages=[
+                {"role":"user","content":step},
+                msg,
+                *tool_results
+            ]
+        )
+        result=second_resp.choices[0].message.content
+    else:
+        result=msg.content
 
     # 打开state 拼接过去完成步骤 拼接前50作为摘要后续我可能会进行修改
     new_past_steps = state.get("past_steps", []) + [f"{step} → {result[:50]}..."]
