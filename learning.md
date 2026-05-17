@@ -590,3 +590,48 @@ print("\n最终黑板上的内容:", result["message"])
 一句话记住
 
 > 加节点用字符串名，调 LLM 要加 await，条件边一定要有终点。
+
+
+
+### 使用graph调用api
+
+```py
+from typing import TypedDict
+
+import asyncio
+from langgraph.graph import StateGraph, START, END
+from app.core.llm import client
+
+# 1. 定义（State）
+class MyState(TypedDict):
+    message: str
+# 试试调用大模型
+async def chat(state: MyState) -> dict:
+    old_msg = state["message"]
+    response = await client.chat.completions.create(
+        model="qwen-plus",
+        messages=[{"role": "user", "content": f"请用正式的语言总结这句话：{old_msg}"}]
+    )
+    reply = response.choices[0].message.content
+    print(f"--- LLM 总结: {reply} ---")
+    return {"message": reply}
+# 4. 画流程图 & 执行
+def build_graph():
+    builder = StateGraph(MyState)
+    builder.add_node("chat", chat)
+    builder.add_edge(START,"chat")
+    builder.add_edge("chat", END)
+    graph = builder.compile()
+    return graph
+
+```
+
+```py
+agent_graph = build_graph()
+@app.post("/api/v1/agent/demo")
+async def graph_demo(request: ChatRequest):
+    result = await agent_graph.ainvoke({"message": request.message})
+    return {"message": result["message"]}
+```
+
+**`ainvoke()` 的参数就是state的初始状态。**

@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import FastAPI
 import uvicorn
 import json
@@ -5,9 +7,11 @@ from pydantic import BaseModel
 from app.core.llm import client
 from app.tools.meta import tool_registry
 from fastapi.responses import StreamingResponse
+from app.agents.graph import build_graph
 
 app=FastAPI(title="Smart Operations Assistant")
 
+agent_graph = build_graph()
 
 
 class ChatRequest(BaseModel):
@@ -79,5 +83,9 @@ async def chat_stream(request:ChatRequest):
         media_type="text/event-stream"
     )
 
+@app.post("/api/v1/agent/demo")
+async def graph_demo(request:ChatRequest):
+    result = await agent_graph.ainvoke({"input": request.message})
+    return {"message": result["response"]}
 if __name__ == "__main__":
     uvicorn.run(app, host="localhost", port=9900)

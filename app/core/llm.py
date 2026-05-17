@@ -17,4 +17,4 @@ async def main():
     )
     #print(resp.choices[0].message.content)
 
-asyncio.run(main())
+#asyncio.run(main())
