@@ -5,8 +5,10 @@ import json
 from click import argument
 from langgraph.graph import StateGraph, START, END
 from app.core.llm import client
+from app.runtime.agent_harness import get_agent_harness
 from app.tools.meta import tool_registry
 
+harness = get_agent_harness()
 
 class PlanExecuteState(TypedDict):
     input: str  # 用户原始问题
@@ -22,14 +24,10 @@ class PlanExecuteState(TypedDict):
 
 async def skill_router(state:PlanExecuteState)->dict:
     """判断用户提出问题属于哪一个诊断领域"""
-    prompt = f"""用户问题: {state['input']}
-    请判断这是哪类问题, 从以下选项中选择一个:
-    - host_resource: CPU/内存/磁盘/本机卡顿
-    - network: ping/HTTP/DNS/端口/网址打不开
-    - generic: 其他无法归类的故障
-    只返回选项名称, 不要其他文字。"""
+    #注入prompt
+    prompt = harness.skill_router_prompt.format(input=state["input"])
     resp=await client.chat.completions.create(
-        model="qwen-plus",
+        model=harness.router_model,
         messages=[{"role":"user","content":prompt}]
     )
     skill=resp.choices[0].message.content.strip()
@@ -40,12 +38,10 @@ async def skill_router(state:PlanExecuteState)->dict:
 #节点Planner（制定计划）
 async def planner(state: PlanExecuteState) -> dict:
     """把用户问题拆成 2-3 个诊断步骤"""
-    prompt = f"""用户问题: {state['input']}
-                请把这个问题拆成 2-3 个诊断步骤，每步一句话。
-                只返回步骤列表，每行一个，不要序号。"""
+    prompt = harness.planner_prompt.format(input=state["input"])
 
     resp = await client.chat.completions.create(
-        model="qwen-plus",
+        model=harness.planner_model,
         messages=[{"role": "user", "content": prompt}]
     )
     steps = resp.choices[0].message.content.strip().split("\n")
@@ -62,7 +58,7 @@ async def executor(state: PlanExecuteState) -> dict:
 
     #第一次调用，让llm决定是否要调用工具
     resp = await client.chat.completions.create(
-        model="qwen-plus",
+        model=harness.executor_model,
         messages=[{"role": "user", "content": step}],
         tools=[info["definition"] for info in tool_registry.values()]
     )
@@ -82,7 +78,7 @@ async def executor(state: PlanExecuteState) -> dict:
             })
         #第二次调用，工具调用结果交给LLM
         second_resp=await client.chat.completions.create(
-            model="qwen-plus",
+            model=harness.executor_model,
             messages=[
                 {"role":"user","content":step},
                 msg,
@@ -111,11 +107,9 @@ async def replanner(state: PlanExecuteState) -> dict:
 
     if idx >= total:
         # 所有步骤执行完毕，生成报告
-        prompt = f"""用户问题: {state['input']}
-                诊断记录: {state['past_steps']}
-                请生成一份完整的诊断报告。"""
+        prompt = harness.replanner_report_prompt.format(input=state["input"],past_steps=state.get("past_steps", []))
         resp = await client.chat.completions.create(
-            model="qwen-plus",
+            model=harness.replanner_model,
             messages=[{"role": "user", "content": prompt}]
         )
         report = resp.choices[0].message.content
