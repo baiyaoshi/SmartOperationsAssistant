@@ -1044,3 +1044,310 @@ async def skill_router(state:PlanExecuteState)->dict:
 
     return {"selected_skill": skill}
 ```
+
+### Skill
+
+先写好skill数据模型
+
+```py
+"""Skill 数据模型 — 每个 Skill 由一个 SKILL.md 文件描述"""
+
+from typing import List, Optional
+from pydantic import BaseModel, Field
+
+
+class Skill(BaseModel):
+    """单个 Skill 的运行时表示"""
+
+    name: str = Field(..., description="Skill 唯一标识, snake_case, 例如 host_resource_diagnosis")
+    display_name: str = Field(..., description="人类可读名称")
+    description: str = Field(..., description="适用场景一句话描述")
+    triggers: List[str] = Field(default_factory=list, description="触发关键字")
+    allowed_tools: List[str] = Field(default_factory=list, description="允许的工具白名单，空=全部允许")
+    risk_level: str = Field(default="low", description="风险等级: low/medium/high")
+
+    # Markdown body
+    playbook: str = Field(default="", description="完整 Markdown 正文")
+    source_path: Optional[str] = Field(default=None, description="源 SKILL.md 文件路径")
+
+    def to_router_card(self) -> str:
+        """生成给 Router LLM 看的菜单条目"""
+        triggers = ", ".join(self.triggers) if self.triggers else "(无)"
+        return (
+            f"- **{self.name}** — {self.display_name}\n"
+            f"  适用场景: {self.description}\n"
+            f"  触发关键字: {triggers}"
+        )
+```
+
+再写loader skill解析器
+
+```py
+"""SKILL.md 解析器 — YAML frontmatter + Markdown body"""
+"""读取skill.md转成skill对象"""
+"""
+SKILL.md 文件内容
+    │
+    ▼
+---                          ← 文件以 --- 开头
+name: host_resource...       ← 中间是 YAML 格式的元信息
+display_name: 主机资源诊断
+triggers: [cpu 高, 内存高]
+---
+                             ← 第二个 --- 之后是正文
+# 主机资源诊断 Playbook      ← Markdown 格式的步骤模板
+1. 检查 CPU 使用率...
+    │
+    │  loader.py 解析
+    ▼
+Skill 对象：
+  name = "host_resource_diagnosis"
+  display_name = "主机资源诊断"
+  triggers = ["cpu 高", "内存高"]
+  playbook = "# 主机资源诊断 Playbook1. 检查 CPU...
+  """
+
+
+import re
+from pathlib import Path
+from typing import Any, Dict, Tuple
+
+import yaml
+
+from app.skills.models import Skill
+
+
+class SkillLoadError(Exception):
+    """SKILL.md 解析失败"""
+
+
+# 匹配: ---\n<yaml>\n---\n<body>
+_FRONTMATTER_RE = re.compile(
+    r"^---\s*\n(.*?)\n---\s*\n(.*)$",
+    re.DOTALL,
+)
+
+
+def _split_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
+    """把 SKILL.md 文本拆成 (frontmatter dict, body str)"""
+    cleaned = text.lstrip("\ufeff")  # 去掉 Windows BOM
+    match = _FRONTMATTER_RE.match(cleaned)
+    if not match:
+        raise SkillLoadError("SKILL.md 必须以 --- 开头，包含 YAML frontmatter")
+    fm_text, body = match.group(1), match.group(2)
+    try:
+        fm = yaml.safe_load(fm_text) or {}
+    except yaml.YAMLError as e:
+        raise SkillLoadError(f"YAML 语法错误: {e}") from e
+    if not isinstance(fm, dict):
+        raise SkillLoadError(f"frontmatter 必须是字典，实际是 {type(fm).__name__}")
+    return fm, body.strip()
+
+
+def load_skill_from_file(path: Path) -> Skill:
+    """从 SKILL.md 文件加载单个 Skill"""
+    text = path.read_text(encoding="utf-8")
+    fm, body = _split_frontmatter(text)
+
+    try:
+        skill = Skill(
+            **fm,
+            playbook=body,
+            source_path=str(path),
+        )
+    except Exception as e:
+        raise SkillLoadError(f"Skill 字段校验失败 ({path}): {e}") from e
+
+    print(f"  [Skill] 已加载: {skill.name} <- {path}")
+    return skill
+```
+
+```python
+class SkillLoadError(Exception):
+    """SKILL.md 解析失败"""
+```
+
+自定义异常
+
+使用例
+
+```py
+try:
+    skill = load_skill_from_file(skill_md)
+except SkillLoadError as e:
+    print(f"跳过文件 {skill_md}: {e}")
+    continue    # 跳过这个坏文件，继续加载下一个
+```
+
+`_FRONTMATTER_RE` 正则
+
+匹配 SKILL.md 的格式：
+
+```
+---                          ← 开头
+name: host_resource_diagnosis
+display_name: 主机资源诊断    ← 中间是 YAML
+---
+# Playbook                   ← 两个 --- 之后是正文
+1. 检查 CPU...
+```
+
+`_split_frontmatter`
+
+| 步骤 | 代码                    | 作用                                                         |
+| ---- | ----------------------- | ------------------------------------------------------------ |
+| 1    | \ufeff 处理             | Windows 记事本存 UTF-8 时会在文件头加个看不见的字符，去掉它  |
+| 2    | _FRONTMATTER_RE.match() | 用正则把文件拆成 YAML 头和 Markdown 正文                     |
+| 3    | yaml.safe_load(fm_text) | 把 YAML 字符串解析成 Python 字典，比如 {"name": "host_resource", "triggers": ["cpu"]} |
+
+返回结果是一个元组：`({"name": "host_resource", ...}, "# Playbook\n1. 检查...")`
+
+`load_skill_from_file`
+
+| 步骤 | 代码                       | 作用                                                         |
+| ---- | -------------------------- | ------------------------------------------------------------ |
+| 1    | path.read_text()           | 把 SKILL.md 文件的全部内容读到内存                           |
+| 2    | _split_frontmatter()       | 拆成 (YAML 字典, 正文)                                       |
+| 3    | Skill(**fm, playbook=body) | 把字典展开传给 Skill 构造函数，**fm 就是把 {"name": "xxx", "display_name": "yyy"} 变成 Skill(name="xxx", display_name="yyy", ...) |
+| 4    | try/except                 | 如果某个字段类型不对（比如 name 不是字符串），Pydantic 会抛异常，统一包成 SkillLoadError |
+
+总结
+
+|                      |                                                  |
+| -------------------- | ------------------------------------------------ |
+| SkillLoadError       | 解析 SKILL.md 出错时抛的异常，让调用方能捕获跳过 |
+| _FRONTMATTER_RE      | 正则，把 ---\nYAML\n---\n正文 拆成两段           |
+| _split_frontmatter   | 用正则拆文件，把 YAML 字符串转成 Python 字典     |
+| load_skill_from_file | 读文件 → 拆 frontmatter → 变成 Skill 对象        |
+
+registry
+
+```py
+"""SkillRegistry — 扫描 definitions/ 目录加载所有 SKILL.md，全局单例"""
+
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from app.skills.loader import SkillLoadError, load_skill_from_file
+from app.skills.models import Skill
+
+# Skill 定义目录
+_DEFINITIONS_DIR = Path(__file__).parent / "definitions"
+
+# 兜底 Skill 名
+GENERIC_SKILL_NAME = "generic_oncall"
+
+
+class SkillRegistry:
+    """加载和管理所有 Skill"""
+
+    def __init__(self, skills: Dict[str, Skill]) -> None:
+        self._skills = skills
+
+    def all(self) -> List[Skill]:
+        return list(self._skills.values())
+
+    def names(self) -> List[str]:
+        return list(self._skills.keys())
+
+    def get(self, name: str) -> Optional[Skill]:
+        return self._skills.get(name)
+
+    def get_or_generic(self, name: Optional[str]) -> Skill:
+        """取指定 Skill，不存在时回退到 generic_oncall"""
+        if name and name in self._skills:
+            return self._skills[name]
+        generic = self._skills.get(GENERIC_SKILL_NAME)
+        if generic is None:
+            raise RuntimeError(f"兜底 Skill {GENERIC_SKILL_NAME!r} 缺失")
+        return generic
+
+    def to_router_menu(self) -> str:
+        """生成给 Router LLM 看的全部 Skill 菜单"""
+        cards = [s.to_router_card() for s in self._skills.values()]
+        return "\n\n".join(cards)
+
+
+def _scan_definitions(root: Path) -> Dict[str, Skill]:
+    """扫描 definitions/ 目录加载所有 SKILL.md"""
+    skills: Dict[str, Skill] = {}
+    if not root.exists():
+        print(f"[Skill] 定义目录不存在: {root}")
+        return skills
+
+    for skill_md in sorted(root.glob("*/SKILL.md")):
+        try:
+            skill = load_skill_from_file(skill_md)
+        except SkillLoadError as e:
+            print(f"[Skill] 跳过 {skill_md}: {e}")
+            continue
+
+        if skill.name in skills:
+            print(f"[Skill] 重名 {skill.name!r}，后者覆盖前者: {skill_md}")
+        skills[skill.name] = skill
+
+    return skills
+
+
+# 全局单例（启动时加载一次）
+_registry: Optional[SkillRegistry] = None
+
+
+def get_skill_registry() -> SkillRegistry:
+    """获取全局 SkillRegistry 单例"""
+    global _registry
+    if _registry is None:
+        skills = _scan_definitions(_DEFINITIONS_DIR)
+        print(f"[Skill] 已加载 {len(skills)} 个 Skill: {list(skills.keys())}")
+        _registry = SkillRegistry(skills)
+    return _registry
+```
+
+| 方法                  | 作用                                        | 例子                                          |
+| --------------------- | ------------------------------------------- | --------------------------------------------- |
+| all()                 | 返回所有 Skill 列表                         | [Skill(...), Skill(...)]                      |
+| names()               | 返回所有 Skill 名字                         | ["host_resource_diagnosis", "generic_oncall"] |
+| get("xxx")            | 按名字取一个 Skill                          | registry.get("host_resource")                 |
+| get_or_generic("xxx") | 取 Skill，找不到就返回兜底的 generic_oncall | 防止 planner/executor 拿到 None 报错          |
+| to_router_menu()      | 生成给 LLM 看的菜单文字                     | 拼装所有 Skill 的 to_router_card()            |
+
+`_scan_definitions`
+
+**扫描 `definitions/` 目录下所有 `\*/SKILL.md` 文件，逐个加载。**
+
+
+
+get_skill_registry` 全局单例
+
+和 `agent_harness.py` 里的 `get_agent_harness()` 完全一样的模式。
+
+| 特性                  | 说明                           |
+| --------------------- | ------------------------------ |
+| 全局变量 _registry    | 第一次调用时加载，后续直接返回 |
+| 只加载一次            | 启动时扫描文件，后续只从内存取 |
+| 改 Skill 文件需要重启 | 不像热加载那么复杂，目前够用   |
+
+
+
+回顾一下整个技能树的工作流：
+
+```
+Skill 注册表 (启动时加载)
+  │
+  ├── host_resource_diagnosis/SKILL.md
+  │     ├── name, display_name, description, triggers
+  │     ├── allowed_tools
+  │     └── playbook (Markdown 正文)
+  │
+  └── generic_oncall/SKILL.md
+        └── ...
+
+skill_router 调 registry.to_router_menu() 动态生成菜单
+  │
+  LLM 从菜单中选 skill_name → "host_resource_diagnosis"
+```
+
+现在加新 Skill 只需要：
+
+1. 在 `app/skills/definitions/` 下建一个 `新skill名/SKILL.md`
+2. 重启服务

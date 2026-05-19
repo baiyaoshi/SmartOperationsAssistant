@@ -6,12 +6,15 @@ from langgraph.graph import StateGraph, START, END
 
 from app.core.llm import client
 from app.runtime.agent_harness import get_agent_harness
+from app.skills.registry import get_skill_registry
 from app.tools.meta import tool_registry
 
 from pydantic import BaseModel, Field
 from app.core.structured import ainvoke_structured
 
 harness = get_agent_harness()
+registry = get_skill_registry()
+menu = registry.to_router_menu()
 
 class PlanExecuteState(TypedDict):
     input: str  # 用户原始问题
@@ -25,7 +28,7 @@ class PlanExecuteState(TypedDict):
     is_finished: bool  # 是否完成
 
 class SkillChoice(BaseModel):
-    skill_name: str = Field(..., description="选中的技能名称: host_resource / network / generic")
+    skill_name: str = Field(..., description=f"选中的技能名称，可选值: {', '.join(registry.names())}")
     confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="置信度 0~1")
     reason: str = Field(default="", description="选择原因")
 
@@ -42,8 +45,15 @@ class ReplannerDecision(BaseModel):
 
 async def skill_router(state:PlanExecuteState)->dict:
     """判断用户提出问题属于哪一个诊断领域"""
+    #加入了skill
+
     #注入prompt
-    prompt = harness.skill_router_prompt.format(input=state["input"])
+    prompt = harness.skill_router_prompt.format(
+        input=state["input"],
+        menu=menu,
+    )
+
+
     try:
         choice = await ainvoke_structured(
             llm=client,

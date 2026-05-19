@@ -21,14 +21,12 @@ class AgentHarness:
     @property
     def skill_router_prompt(self) -> str:
         return """用户问题: {input}
-                请判断这是哪类问题, 从以下选项中选择一个:
-                - host_resource: CPU/内存/磁盘/本机卡顿
-                - network: ping/HTTP/DNS/端口/网址打不开
-                - generic: 其他无法归类的故障
-                请用 JSON 格式返回，包含以下字段:
-                - skill_name: 选中的技能名称
-                - confidence: 置信度 (0~1)
-                - reason: 选择原因"""
+            请从以下 Skill 菜单中选择一个最匹配的:
+            {menu}
+            请用 JSON 格式返回，包含以下字段:
+            - skill_name: 选中的技能名称
+            - confidence: 置信度 (0~1)
+            - reason: 选择原因"""
 
     # Planner Prompt
     @property
