@@ -4,6 +4,10 @@ from fastapi import FastAPI
 import uvicorn
 import json
 from pydantic import BaseModel
+from starlette.staticfiles import StaticFiles
+
+from pathlib import Path
+
 from app.core.llm import client
 from app.tools.meta import tool_registry
 from fastapi.responses import StreamingResponse
@@ -12,8 +16,12 @@ from app.agents.graph import build_graph
 app=FastAPI(title="Smart Operations Assistant")
 
 agent_graph = build_graph()
+# 挂载前端静态文件
+# 项目根目录
+BASE_DIR = Path(__file__).resolve().parent.parent
 
-
+# 在 agent_graph = build_graph() 后面
+app.mount("/frontend", StaticFiles(directory=str(BASE_DIR / "frontend"), html=True), name="frontend")
 class ChatRequest(BaseModel):
     message: str
 
@@ -91,9 +99,9 @@ async def graph_demo(request:ChatRequest):
 
 async def graph_stream_response(message: str):
     """流式输出图的执行过程"""
-    # 用 astream 替代 ainvoke，每次产生一个事件
+    final_response = None
+
     async for event in agent_graph.astream({"input": message}):
-        # event 的结构：{"节点名": {"字段名": 值, ...}}
         for node_name, node_output in event.items():
             if node_name == "skill_router":
                 yield f"data:选择技能: {node_output.get('selected_skill', '')}\n\n"
@@ -102,16 +110,24 @@ async def graph_stream_response(message: str):
                 yield f"data:计划: {json.dumps(steps, ensure_ascii=False)}\n\n"
             elif node_name == "executor":
                 step = node_output.get("current_step", "")
-                yield f"data:执行: {step}\n\n"
+                result = node_output.get("current_result", "")
+                if step:
+                    yield f"data:执行: {step}\n\n"
+                if result:
+                    yield f"data:结果: {result[:100]}...\n\n"
             elif node_name == "replanner":
                 if node_output.get("is_finished"):
                     yield f"data:完成，生成报告...\n\n"
+                    # 从 astream 结果中拿 response
+                    final_response = node_output.get("response", "")
                 else:
                     yield f"data:继续下一步...\n\n"
 
-    # 最后拿完整结果
-    result = await agent_graph.ainvoke({"input": message})
-    yield f"data: 📝 报告:\n{result['response']}\n\n"
+    if final_response:
+        yield f"data: 📝 报告:\n\n"
+        # 报告内容分行输出
+        for line in final_response.split("\n"):
+            yield f"data: {line}\n\n"
     yield "data: [DONE]\n\n"
 
 

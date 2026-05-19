@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Operations Assistant</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: #f5f5f5;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        .header {
+            background: #1a1a2e;
+            color: white;
+            padding: 16px 24px;
+            font-size: 18px;
+            font-weight: 600;
+        }
+        .container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            max-width: 900px;
+            width: 100%;
+            margin: 0 auto;
+            padding: 16px;
+        }
+        #output {
+            flex: 1;
+            overflow-y: auto;
+            background: white;
+            border-radius: 8px;
+            padding: 16px;
+            margin-bottom: 16px;
+            font-size: 14px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+        .event-line {
+            padding: 4px 0;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        .event-skill { color: #1890ff; }
+        .event-plan { color: #722ed1; }
+        .event-exec { color: #fa8c16; }
+        .event-result { color: #52c41a; }
+        .event-report { color: #333; font-weight: 600; }
+        .event-done { color: #999; }
+        .input-area {
+            display: flex;
+            gap: 8px;
+        }
+        #input {
+            flex: 1;
+            padding: 10px 14px;
+            border: 1px solid #d9d9d9;
+            border-radius: 6px;
+            font-size: 14px;
+            outline: none;
+        }
+        #input:focus { border-color: #1890ff; }
+        #btn {
+            padding: 10px 24px;
+            background: #1890ff;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        #btn:hover { background: #40a9ff; }
+        #btn:disabled { background: #d9d9d9; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+    <div class="header">🔧 Smart Operations Assistant</div>
+    <div class="container">
+        <div id="output"></div>
+        <div class="input-area">
+            <input id="input" type="text" placeholder="输入问题，例如：我的电脑很卡" onkeydown="if(event.key==='Enter') send()">
+            <button id="btn" onclick="send()">发送</button>
+        </div>
+    </div>
+
+    <script>
+        const output = document.getElementById('output');
+        const input = document.getElementById('input');
+        const btn = document.getElementById('btn');
+
+        function addLine(text, className = '') {
+            const div = document.createElement('div');
+            div.className = 'event-line ' + className;
+            div.textContent = text;
+            output.appendChild(div);
+            output.scrollTop = output.scrollHeight;
+        }
+
+        async function send() {
+            const message = input.value.trim();
+            if (!message) return;
+
+            output.innerHTML = '';
+            addLine('>>> ' + message, '');
+            btn.disabled = true;
+
+            try {
+                const response = await fetch('/api/v1/agent/demo/stream', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message })
+                });
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (!line.startsWith('data: ')) continue;
+                        const data = line.slice(6);
+
+                        if (data === '[DONE]') {
+                            addLine('--- 诊断完成 ---', 'event-done');
+                            continue;
+                        }
+
+                        if (data.startsWith('选择技能')) {
+                            addLine('📌 ' + data, 'event-skill');
+                        } else if (data.startsWith('计划')) {
+                            addLine('📋 ' + data, 'event-plan');
+                        } else if (data.startsWith('执行')) {
+                            addLine('🔧 ' + data, 'event-exec');
+                        } else if (data.startsWith('结果')) {
+                            addLine('📊 ' + data, 'event-result');
+                        } else if (data.startsWith('📝')) {
+                            addLine('', '');
+                            addLine(data, 'event-report');
+                        } else if (data.startsWith('继续')) {
+                            addLine('⏭ ' + data, '');
+                        } else if (data.startsWith('完成')) {
+                            addLine('✅ ' + data, '');
+                        } else {
+                            addLine(data, '');
+                        }
+                    }
+                }
+            } catch (err) {
+                addLine('❌ 连接失败: ' + err.message, '');
+            } finally {
+                btn.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>
