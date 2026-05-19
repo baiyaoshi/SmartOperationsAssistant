@@ -913,3 +913,134 @@ LLM 说"调 get_weather，参数 city=北京"
   → 用 **arguments 把参数传进去
   → 函数执行，返回结果
 ```
+
+### 让llm返回固定的json
+
+structured.py
+
+```py
+"""结构化输出兼容层 — 让 LLM 返回 JSON，解析成 Pydantic 对象"""
+
+import json
+import re
+from typing import Type, TypeVar
+
+from pydantic import BaseModel
+
+T = TypeVar("T", bound=BaseModel)
+
+
+def _schema_hint(schema_cls: Type[BaseModel]) -> str:
+    """把 Pydantic 模型转换成 JSON 字段说明文本，塞给 LLM"""
+    schema = schema_cls.model_json_schema()
+    props = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    lines = []
+    for name, meta in props.items():
+        type_name = meta.get("type") or "any"
+        req = "必填" if name in required else "可选"
+        desc = meta.get("description", "")
+        lines.append(f'  - "{name}" ({req}, {type_name}): {desc}')
+    return "\n".join(lines)
+
+
+def _extract_json(text: str) -> dict:
+    """从 LLM 回复中提取 JSON 对象（兼容 ```json 代码块）"""
+    raw = text.strip()
+    # 去掉 markdown 代码块标记
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # 如果整段不是 JSON，尝试从中提取 {...}
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            raise ValueError(f"无法从 LLM 回复中提取 JSON: {text[:200]}")
+        return json.loads(match.group(0))
+```
+
+你的 `skill_router` 节点目前是这样拿 LLM 结果的：
+
+```python
+resp = await client.chat.completions.create(
+    model=harness.router_model,
+    messages=[{"role": "user", "content": prompt}]
+)
+skill = resp.choices[0].message.content.strip()
+```
+
+问题：**你完全信任 LLM 会"乖乖返回选项名称，不要其他文字"**。
+
+但 LLM 经常不听话：
+
+- ✅ `"host_resource"`
+- ❌ `"这个问题属于 host_resource 类型"`
+- ❌ `"host_resource（CPU/内存/磁盘）"`
+- ❌ `"根据你的描述，我判断是 host_resource 问题"`
+- ❌ 甚至可能返回空字符串或一堆废话
+
+你的后续代码直接拿 `skill` 去做逻辑判断，一旦格式不对就崩了。
+
+解决方案的思路
+
+不让 LLM 返回**自由文本**，而是要求它返回**固定结构的 JSON**：
+
+```
+用户问："我的电脑很卡"
+LLM 返回 JSON → {"skill_name": "host_resource", "confidence": 0.95}
+```
+
+然后用代码**解析 + 校验**这个 JSON：
+
+```python
+# 如果 JSON 里缺了 skill_name 字段 → 报错，走默认值
+# 如果 confidence 不在 0~1 之间 → 报错，走默认值
+```
+
+```
+LLM 返回文本
+    ↓
+_extract_json()      → 把文本里的 JSON 扒出来（兼容各种 messy 格式）
+    ↓
+schema_cls.model_validate()  → 用 Pydantic 校验字段类型/必填
+    ↓
+返回 Pydantic 对象  → 后面代码直接 .field_name 取值，安全可靠
+```
+
+三个函数的职责
+
+| 函数                 | 职责                                                         | 为什么需要                                                   |
+| -------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ |
+| _schema_hint()       | 把 Pydantic 模型转成文字说明，告诉 LLM "按这个结构返回 JSON" | LLM 要知道 JSON 长什么样才能按格式输出                       |
+| _extract_json()      | 从 LLM 回复的文本里提取 JSON 对象                            | LLM 可能返回 json\n{...}\n，也可能直接返回 {...}，也可能在废话中间夹一个 {...} |
+| ainvoke_structured() | 调 LLM → 解析 → 校验 → 重试 的完整流程                       | 把"调 LLM"和"拿结构化数据"两步打包成一个函数，所有节点通用   |
+
+使用例
+
+```py
+class SkillChoice(BaseModel):
+    skill_name: str = Field(..., description="选中的技能名称: host_resource / network / generic")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="置信度 0~1")
+    reason: str = Field(default="", description="选择原因")
+
+async def skill_router(state:PlanExecuteState)->dict:
+    """判断用户提出问题属于哪一个诊断领域"""
+    #注入prompt
+    prompt = harness.skill_router_prompt.format(input=state["input"])
+    try:
+        choice = await ainvoke_structured(
+            llm=client,
+            schema_cls=SkillChoice,
+            messages=[{"role": "user", "content": prompt}],
+            model_name=harness.router_model,
+        )
+        skill = choice.skill_name.strip().lower()
+        print(f"选择了 Skill：{skill} (置信度: {choice.confidence}, 原因: {choice.reason})")
+    except Exception as e:
+        print(f"  skill_router LLM 调用失败，走默认值: {e}")
+        skill = "generic"
+
+    return {"selected_skill": skill}
+```

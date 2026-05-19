@@ -2,11 +2,14 @@
 
 from typing import TypedDict, List
 import json
-from click import argument
 from langgraph.graph import StateGraph, START, END
+
 from app.core.llm import client
 from app.runtime.agent_harness import get_agent_harness
 from app.tools.meta import tool_registry
+
+from pydantic import BaseModel, Field
+from app.core.structured import ainvoke_structured
 
 harness = get_agent_harness()
 
@@ -21,18 +24,40 @@ class PlanExecuteState(TypedDict):
     step_index: int  # 当前步数
     is_finished: bool  # 是否完成
 
+class SkillChoice(BaseModel):
+    skill_name: str = Field(..., description="选中的技能名称: host_resource / network / generic")
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="置信度 0~1")
+    reason: str = Field(default="", description="选择原因")
+
+class Plan(BaseModel):
+    steps: List[str] = Field(
+        ...,
+        description="按顺序执行的步骤列表, 每步一句话",
+    )
+
+class ReplannerDecision(BaseModel):
+    is_finished: bool = Field(..., description="诊断是否完成，true=生成报告，false=继续执行")
+    plan: List[str] = Field(default_factory=list, description="剩余步骤，仅当 is_finished=false 时有值")
+    response: str = Field(default="", description="最终报告，仅当 is_finished=true 时有值")
 
 async def skill_router(state:PlanExecuteState)->dict:
     """判断用户提出问题属于哪一个诊断领域"""
     #注入prompt
     prompt = harness.skill_router_prompt.format(input=state["input"])
-    resp=await client.chat.completions.create(
-        model=harness.router_model,
-        messages=[{"role":"user","content":prompt}]
-    )
-    skill=resp.choices[0].message.content.strip()
-    print(f"选择了Skill：{skill}")
-    return {"selected_skill":skill}
+    try:
+        choice = await ainvoke_structured(
+            llm=client,
+            schema_cls=SkillChoice,
+            messages=[{"role": "user", "content": prompt}],
+            model_name=harness.router_model,
+        )
+        skill = choice.skill_name.strip().lower()
+        print(f"选择了 Skill：{skill} (置信度: {choice.confidence}, 原因: {choice.reason})")
+    except Exception as e:
+        print(f"  skill_router LLM 调用失败，走默认值: {e}")
+        skill = "generic"
+
+    return {"selected_skill": skill}
 
 
 #节点Planner（制定计划）
@@ -40,11 +65,18 @@ async def planner(state: PlanExecuteState) -> dict:
     """把用户问题拆成 2-3 个诊断步骤"""
     prompt = harness.planner_prompt.format(input=state["input"])
 
-    resp = await client.chat.completions.create(
-        model=harness.planner_model,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    steps = resp.choices[0].message.content.strip().split("\n")
+    try:
+        plan = await ainvoke_structured(
+            llm=client,
+            schema_cls=Plan,
+            messages=[{"role": "user", "content": prompt}],
+            model_name=harness.planner_model,
+        )
+        steps = plan.steps
+    except Exception as e:
+        print(f"  planner LLM 调用失败，走默认计划: {e}")
+        steps = ["收集系统基础信息", "分析异常指标", "汇总诊断结论"]
+
     print(f"计划: {steps}")
     return {"plan": steps, "step_index": 0, "is_finished": False}
 
@@ -70,7 +102,9 @@ async def executor(state: PlanExecuteState) -> dict:
             tool_name=tool_call.function.name
             tool_info=tool_registry[tool_name]
             arguments=json.loads(tool_call.function.arguments)
+            print(f"  → 调用工具: {tool_name}, 参数: {arguments}")
             result=tool_info["function"](**arguments)
+            print(f"  ← 工具返回: {result}")
             tool_results.append({
                 "role":"tool",
                 "tool_call_id":tool_call.id,
@@ -90,7 +124,7 @@ async def executor(state: PlanExecuteState) -> dict:
         result=msg.content
 
     # 打开state 拼接过去完成步骤 拼接前50作为摘要后续我可能会进行修改
-    new_past_steps = state.get("past_steps", []) + [f"{step} → {result[:50]}..."]
+    new_past_steps = state.get("past_steps", []) + [f"{step} → {result}..."]
     return {
         "current_step": step,
         "current_result": result,
@@ -101,24 +135,39 @@ async def executor(state: PlanExecuteState) -> dict:
 
 #节点Replanner（评估进度）
 async def replanner(state: PlanExecuteState) -> dict:
-    """判断是否完成"""
+    """评估进度，决定继续还是生成报告"""
     idx = state["step_index"]
     total = len(state["plan"])
+    past_steps = state.get("past_steps", [])
 
-    if idx >= total:
-        # 所有步骤执行完毕，生成报告
-        prompt = harness.replanner_report_prompt.format(input=state["input"],past_steps=state.get("past_steps", []))
-        resp = await client.chat.completions.create(
-            model=harness.replanner_model,
-            messages=[{"role": "user", "content": prompt}]
+    prompt = harness.replanner_prompt.format(
+        input=state["input"],
+        past_steps="\n".join(past_steps) if past_steps else "(暂无)",
+    )
+
+    try:
+        decision = await ainvoke_structured(
+            llm=client,
+            schema_cls=ReplannerDecision,
+            messages=[{"role": "user", "content": prompt}],
+            model_name=harness.replanner_model,
         )
-        report = resp.choices[0].message.content
-        print(f" 报告生成完成")
-        return {"response": report, "is_finished": True}
-    else:
-        print(f" 还有 {total - idx} 步未执行，继续")
-        return {"is_finished": False}
 
+        if decision.is_finished:
+            print(f" 报告生成完成")
+            return {"response": decision.response, "is_finished": True}
+        else:
+            print(f" 还有 {len(decision.plan)} 步未执行，继续")
+            return {"plan": decision.plan, "is_finished": False}
+
+    except Exception as e:
+        print(f"  replanner LLM 调用失败，走兜底: {e}")
+        if idx >= total:
+            # 兜底生成简单报告
+            summary = "\n".join(past_steps) if past_steps else "未收集到有效信息"
+            return {"response": f"诊断报告:\n{summary}", "is_finished": True}
+        else:
+            return {"is_finished": False}
 
 #条件边: 判断是否继续
 def should_continue(state: PlanExecuteState) -> str:

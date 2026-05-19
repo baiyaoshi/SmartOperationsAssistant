@@ -25,14 +25,18 @@ class AgentHarness:
                 - host_resource: CPU/内存/磁盘/本机卡顿
                 - network: ping/HTTP/DNS/端口/网址打不开
                 - generic: 其他无法归类的故障
-                只返回选项名称, 不要其他文字。"""
+                请用 JSON 格式返回，包含以下字段:
+                - skill_name: 选中的技能名称
+                - confidence: 置信度 (0~1)
+                - reason: 选择原因"""
 
     # Planner Prompt
     @property
     def planner_prompt(self) -> str:
         return """用户问题: {input}
                 请把这个问题拆成 2-3 个诊断步骤，每步一句话。
-                只返回步骤列表，每行一个，不要序号。"""
+                请用 JSON 格式返回，包含以下字段:
+                - steps: 诊断步骤列表，每步一个字符串"""
 
     # Executor Prompt
     @property
@@ -41,10 +45,16 @@ class AgentHarness:
 
     # Replanner Prompt (生成报告)
     @property
-    def replanner_report_prompt(self) -> str:
+    def replanner_prompt(self) -> str:
         return """用户问题: {input}
-                诊断记录: {past_steps}
-                请生成一份完整的诊断报告。"""
+                已完成步骤: {past_steps}
+                请判断诊断是否完成。
+                如果还有步骤需要执行，返回剩余步骤列表。
+                如果已完成，返回最终诊断报告。
+                请用 JSON 格式返回，包含以下字段:
+                - is_finished: true=完成生成报告，false=继续执行
+                - plan: 剩余步骤列表（仅is_finished=false时有值）
+                - response: 最终报告（仅is_finished=true时有值）"""
 
 
 # 全局单例
