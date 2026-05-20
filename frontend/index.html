@@ -91,6 +91,16 @@
         const input = document.getElementById('input');
         const btn = document.getElementById('btn');
 
+        // 从 URL 参数读取 session_id，没有就生成新的
+        const urlParams = new URLSearchParams(window.location.search);
+        let sessionId = urlParams.get('session_id');
+        if (!sessionId) {
+            sessionId = 'session_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+            // 把 session_id 追加到 URL，不刷新页面
+            const newUrl = window.location.pathname + '?session_id=' + sessionId;
+            window.history.replaceState({}, '', newUrl);
+        }
+
         function addLine(text, className = '') {
             const div = document.createElement('div');
             div.className = 'event-line ' + className;
@@ -108,10 +118,10 @@
             btn.disabled = true;
 
             try {
-                const response = await fetch('/api/v1/agent/demo/stream', {
+                const response = await fetch('/api/v1/agent/demo/memory/stream', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message })
+                    body: JSON.stringify({ message, session_id: sessionId })
                 });
 
                 const reader = response.body.getReader();
@@ -135,20 +145,20 @@
                             continue;
                         }
 
-                        if (data.startsWith('选择技能')) {
+                        if (data.includes('选择技能')) {
                             addLine('📌 ' + data, 'event-skill');
-                        } else if (data.startsWith('计划')) {
+                        } else if (data.includes('计划:')) {
                             addLine('📋 ' + data, 'event-plan');
-                        } else if (data.startsWith('执行')) {
+                        } else if (data.includes('执行')) {
                             addLine('🔧 ' + data, 'event-exec');
-                        } else if (data.startsWith('结果')) {
+                        } else if (data.includes('结果')) {
                             addLine('📊 ' + data, 'event-result');
-                        } else if (data.startsWith('📝')) {
+                        } else if (data.includes('📝')) {
                             addLine('', '');
                             addLine(data, 'event-report');
-                        } else if (data.startsWith('继续')) {
+                        } else if (data.includes('继续')) {
                             addLine('⏭ ' + data, '');
-                        } else if (data.startsWith('完成')) {
+                        } else if (data.includes('完成') || data.includes('完毕')) {
                             addLine('✅ ' + data, '');
                         } else {
                             addLine(data, '');
