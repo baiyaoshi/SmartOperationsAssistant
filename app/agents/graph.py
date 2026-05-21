@@ -110,6 +110,7 @@ async def executor(state: PlanExecuteState) -> dict:
     idx = state["step_index"]
     step = state["plan"][idx]
     print(f" 执行第 {idx + 1} 步: {step}")
+    print(f"  [executor] loop_count from state: {state.get('loop_count', 'N/A')}")
 
     #第一次调用，让llm决定是否要调用工具
     resp = await client.chat.completions.create(
@@ -126,7 +127,18 @@ async def executor(state: PlanExecuteState) -> dict:
             tool_info=tool_registry[tool_name]
             arguments=json.loads(tool_call.function.arguments)
             print(f"  → 调用工具: {tool_name}, 参数: {arguments}")
-            result=tool_info["function"](**arguments)
+            #result=tool_info["function"](**arguments)
+
+            # 根据工具类型决定调用方式
+            if tool_info["type"] == "local":
+                print(f"  → [本地] 直接调用函数")
+                result = tool_info["function"](**arguments)
+            elif tool_info["type"] == "mcp":
+                print(f"  → [MCP] 通过 {tool_info['server']} 服务器调用")
+                from app.core.mcp_client import call_mcp_tool
+                result = await call_mcp_tool(tool_info["server"], tool_name, arguments)
+
+
             print(f"  ← 工具返回: {result}")
             await push_event(f"data: 工具: {tool_name} 返回: {result[:100]}...\n\n")
             tool_results.append({

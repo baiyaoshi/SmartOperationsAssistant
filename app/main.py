@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 import uvicorn
@@ -13,11 +14,25 @@ from pathlib import Path
 from app.core.llm import client
 from app.runtime.stream_sink import set_sink_queue, sink_generator, clear_sink_queue
 from app.services import chat_memory
-from app.tools.meta import tool_registry
+from app.tools.meta import tool_registry, get_all_tools
+from app.tools.mcp_loader import discover_and_register_mcp_tools
+from app.core.mcp_client import close_all
 from fastapi.responses import StreamingResponse
 from app.agents.graph import build_graph
 
-app=FastAPI(title="Smart Operations Assistant")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期：启动时发现 MCP 工具，关闭时断开 MCP 连接"""
+    print("[启动] 发现 MCP 工具...")
+    await discover_and_register_mcp_tools()
+    print(f"[启动] MCP 工具加载完成，共 {len(get_all_tools())} 个工具")
+    yield
+    print("[关闭] 断开 MCP 连接...")
+    await close_all()
+
+
+app = FastAPI(title="Smart Operations Assistant", lifespan=lifespan)
 
 agent_graph = build_graph()
 # 挂载前端静态文件
