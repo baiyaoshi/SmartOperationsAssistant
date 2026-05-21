@@ -1,3 +1,9 @@
+我是一名agent初学者，希望通过一个项目来深入了解agent，参考项目F:\develop\agent\mutil-rag-agent 你可能丢失了一些记忆，请重新阅读我的项目和参考项目，阅读我的md文件，并且给出我接下来应该完成的事情，在你指导我的时候，最好不要给我直接生成代码，告诉我应该干什么
+
+
+
+
+
 async await
 
 ```py
@@ -1351,3 +1357,108 @@ skill_router 调 registry.to_router_menu() 动态生成菜单
 
 1. 在 `app/skills/definitions/` 下建一个 `新skill名/SKILL.md`
 2. 重启服务
+
+
+
+
+
+### Redis记忆存储
+
+`app/services/chat_memory.py` — 记忆存储层
+
+提供 4 个核心函数：
+
+| 函数                                        | 功能                          |
+| ------------------------------------------- | ----------------------------- |
+| append_message(session_id, role, content)   | 追加一条消息到 session        |
+| get_messages(session_id)                    | 获取 session 所有消息         |
+| append_diagnosis_report(report, session_id) | 存诊断报告（跨 session 共享） |
+| get_recent_diagnosis_reports(limit)         | 取最近 N 份诊断报告           |
+
+每个消息存 JSON：`{"role": "user/assistant", "content": "...", "ts": "..."}`
+
+Redis 键格式：
+
+- `aiops:chat:{session_id}:messages` — 对话消息（List）
+- `aiops:diagnosis:reports` — 诊断报告（List，跨 session 共享）
+
+ `frontend/index.html` — 前端传 session_id
+
+- 页面加载时从 URL 参数读 `session_id`
+- 没有则自动生成：`session_时间戳_随机数`
+- 写入 URL（`?session_id=xxx`），刷新可见
+- 每次请求带上 `session_id` 字段
+
+
+
+redis中数据
+
+```
+[
+  {"role": "user", "content": "我的名字是白曜石"},
+  {"role": "assistant", "content": "已确认：白曜石"},
+  {"role": "user", "content": "我喜欢编程"},
+  {"role": "assistant", "content": "很好！"}
+]
+```
+
+
+
+```py
+async def graph_memory_stream_response(message: str, session_id: str):
+    """带记忆的流式诊断"""
+    # 1. 存用户消息
+    await chat_memory.append_message(session_id, role="user", content=message)
+    # 2. 读取历史消息，构造上下文
+    history = await chat_memory.get_messages(session_id)
+
+    # 历史消息：去掉当前这条，取最近6条
+    if len(history) > 1:
+        recent = history[:-1]          # 去掉当前消息
+        recent = recent[-6:]           # 最多留6条
+    else:
+        recent = []
+    # 把历史拼成文本
+    context = ""
+    if recent:
+        lines = []
+        for msg in recent:
+            if msg["role"] == "user":
+                role = "用户"
+            else:
+                role = "助手"
+            content = msg["content"]
+            lines.append(f"{role}: {content}")
+        context = "以下是对话历史：\n" + "\n".join(lines) + "\n\n"
+
+    # 历史 + 当前问题，传给图
+    if context:
+        augmented_input = context + message
+    else:
+        augmented_input = message
+
+    # 3. 跑图（带上历史上下文）
+    final_response = None
+    async for event in agent_graph.astream({"input": augmented_input}):
+        for node_name, node_output in event.items():
+            if node_name == "skill_router":
+                yield f"data:选择技能: {node_output.get('selected_skill', '')}\n\n"
+            elif node_name == "planner":
+                steps = node_output.get("plan", [])
+                yield f"data:计划: {json.dumps(steps, ensure_ascii=False)}\n\n"
+            elif node_name == "executor":
+                step = node_output.get("current_step", "")
+                result = node_output.get("current_result", "")
+                if step:
+                    yield f"data:执行: {step}\n\n"
+                if result:
+                    yield f"data:结果: {result[:100]}...\n\n"
+            elif node_name == "replanner":
+                if node_output.get("is_finished"):
+                    yield f"data:完成，生成报告...\n\n"
+                    final_response = node_output.get("response", "")
+                else:
+                    yield f"data:继续下一步...\n\n"
+
+```
+
