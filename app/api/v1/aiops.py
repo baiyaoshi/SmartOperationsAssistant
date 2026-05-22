@@ -1,12 +1,11 @@
 import asyncio
 
 from fastapi import APIRouter
-from pydantic import BaseModel
-import uvicorn
 from fastapi.responses import StreamingResponse
 
 
 from app.agents.graph import build_graph
+from app.schemas.chat import ChatRequest
 
 agent_graph = build_graph()
 
@@ -15,13 +14,6 @@ from app.services import chat_memory
 
 router = APIRouter(tags=["aiops"])
 
-class ChatRequest(BaseModel):
-    message: str
-    session_id: str = "default"
-
-class ChatRequestWithSession(BaseModel):
-    message: str
-    session_id: str = "default"
 
 async def graph_memory_stream_response(message: str, session_id: str):
     """带记忆的流式诊断（使用 stream_sink 实时推送）"""
