@@ -3,6 +3,7 @@
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/F%3A/develop/agent/SmartOperationsAssistant/.venv" />
     </content>
     <orderEntry type="jdk" jdkName="uv (SmartOperationsAssistant)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
