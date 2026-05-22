@@ -2,6 +2,11 @@
 
 
 
+1. **新建 `network_server.py`**（网络诊断 MCP 服务器，ping/HTTP/DNS/端口）
+2. **新建 `docker_server.py`**（Docker 管理 MCP 服务器）
+3. **开始轻量 RAG 知识库**（chromadb）
+4. **整理项目结构**（路由拆分到 `api/v1/`）
+
 
 
 async await
@@ -1462,3 +1467,234 @@ async def graph_memory_stream_response(message: str, session_id: str):
 
 ```
 
+
+
+### MCP
+
+```py
+"""MCP 客户端管理 — 连接 MCP 服务器，发现工具、调用工具"""
+
+import json
+import httpx
+from typing import Any
+
+# MCP 服务器配置
+MCP_SERVERS = {
+    "system": {
+        "url": "http://127.0.0.1:9001",
+        "description": "系统诊断 (CPU/内存/磁盘/进程)"
+    }
+}
+
+
+class MCPClient:
+    """单个 MCP 服务器的客户端"""
+
+    def __init__(self, name: str, base_url: str):
+        self.name = name
+        self.base_url = base_url.rstrip("/")
+        self._client = httpx.AsyncClient(timeout=30.0)
+
+    async def list_tools(self) -> list[dict]:
+        """获取该服务器上的所有工具列表"""
+        resp = await self._client.post(f"{self.base_url}/list_tools")
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("tools", [])
+
+    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
+        """调用该服务器上的一个工具"""
+        resp = await self._client.post(
+            f"{self.base_url}/call_tool",
+            json={"name": tool_name, "arguments": arguments}
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("content", "")
+
+    async def close(self):
+        await self._client.aclose()
+
+
+# 全局缓存：server_name → MCPClient 实例
+_clients: dict[str, MCPClient] = {}
+
+
+async def get_client(server_name: str) -> MCPClient:
+    """获取（或创建）指定服务器的客户端"""
+    if server_name not in _clients:
+        config = MCP_SERVERS.get(server_name)
+        if not config:
+            raise ValueError(f"未知的 MCP 服务器: {server_name}")
+        _clients[server_name] = MCPClient(server_name, config["url"])
+    return _clients[server_name]
+
+
+async def discover_all_tools() -> list[dict]:
+    """发现所有 MCP 服务器上的工具，返回 OpenAI 格式的 tool definition 列表"""
+    all_tools = []
+    for server_name in MCP_SERVERS:
+        try:
+            client = await get_client(server_name)
+            tools = await client.list_tools()
+            for tool in tools:
+                # 转成 OpenAI function call 格式
+                definition = {
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("inputSchema", {"type": "object", "properties": {}})
+                    }
+                }
+                all_tools.append({
+                    "server": server_name,
+                    "name": tool["name"],
+                    "definition": definition,
+                    "function": None  # MCP 工具没有本地函数
+                })
+        except Exception as e:
+            print(f"  [MCP] 发现工具失败 ({server_name}): {e}")
+    return all_tools
+
+
+async def call_mcp_tool(server_name: str, tool_name: str, arguments: dict) -> str:
+    """调用 MCP 工具"""
+    client = await get_client(server_name)
+    try:
+        result = await client.call_tool(tool_name, arguments)
+        return result
+    except Exception as e:
+        return f"工具 {tool_name} 调用失败: {e}"
+
+
+async def close_all():
+    """关闭所有 MCP 连接"""
+    for client in _clients.values():
+        await client.close()
+    _clients.clear()
+```
+
+整体：为什么需要 MCP 客户端？
+
+你现在的 executor 调工具是这样的：
+
+```
+executor → tool_registry["get_cpu_usage"]["function"](参数)
+         → system_tool.py 里的那个 Python 函数
+```
+
+MCP 之后变成：
+
+```
+executor → tool_registry → 发现是 MCP 工具
+         → mcp_client.call_mcp_tool("system", "get_cpu_usage", 参数)
+         → HTTP 请求 → system_server.py（另一个进程）
+         → psutil → 返回结果
+```
+
+所以 `mcp_client.py` 就是负责**发 HTTP 请求**的那一层。
+
+
+
+修改meta.py
+
+```py
+"""工具路由器 — 支持本地工具 + MCP 工具"""
+
+from typing import Optional
+
+from app.tools.system_tool import get_cpu_usage, cpu_tool_definition, get_memory_usage, memory_tool_definition, \
+    get_disk_usage, disk_tool_definition, get_top_processes, top_processes_tool_definition
+from app.tools.time_tool import get_current_time, time_tool_definition
+from app.tools.weather_tool import get_weather, weather_tool_definition
+
+# ── 工具条目结构 ──
+# 每个工具可以是以下两种类型之一：
+#   1. 本地工具: {"type": "local", "function": <Python函数>, "definition": <OpenAI格式>}
+#   2. MCP 工具: {"type": "mcp", "server": "system", "definition": <OpenAI格式>}
+
+_tool_registry: dict = {}
+
+def register_local_tool(name: str, func, definition: dict):
+    """注册一个本地工具（直接在进程内调用）"""
+    _tool_registry[name] = {
+        "type": "local",
+        "function": func,
+        "definition": definition,
+        "description": definition.get("function", {}).get("description", "")
+    }
+
+def register_mcp_tool(name: str, server: str, definition: dict):
+    """注册一个 MCP 工具（通过 MCP 协议调用）"""
+    _tool_registry[name] = {
+        "type": "mcp",
+        "server": server,
+        "definition": definition,
+        "description": definition.get("function", {}).get("description", "")
+    }
+
+def get_tool(name: str) -> Optional[dict]:
+    """获取工具信息"""
+    return _tool_registry.get(name)
+
+def get_all_tools() -> list[dict]:
+    """获取所有工具的 definition（用于传给 LLM）"""
+    return [info["definition"] for info in _tool_registry.values()]
+
+def get_tool_names() -> list[str]:
+    """获取所有工具名"""
+    return list(_tool_registry.keys())
+
+# ── 注册本地工具 ──
+register_local_tool("get_current_time", get_current_time, time_tool_definition)
+register_local_tool("get_weather", get_weather, weather_tool_definition)
+register_local_tool("get_cpu_usage", get_cpu_usage, cpu_tool_definition)
+register_local_tool("get_memory_usage", get_memory_usage, memory_tool_definition)
+register_local_tool("get_disk_usage", get_disk_usage, disk_tool_definition)
+register_local_tool("get_top_processes", get_top_processes, top_processes_tool_definition)
+
+
+# ── 以下工具会通过 MCP 发现后注册 ──
+# 注册 MCP 工具的代码在 mcp_loader.py 中
+
+# 为了方便外部引用，保持兼容
+tool_registry = _tool_registry  # 别名，旧的 import 还能用
+```
+
+mcp_loader.py
+
+```py
+"""MCP 工具加载器 — 连接 MCP 服务器发现工具，注册到工具注册表"""
+
+from app.tools.meta import register_mcp_tool
+from app.core.mcp_client import MCP_SERVERS, get_client
+
+
+async def discover_and_register_mcp_tools():
+    """连接所有 MCP 服务器，发现工具并注册到全局注册表
+
+    在应用启动时调用一次。
+    """
+    for server_name in MCP_SERVERS:
+        try:
+            client = await get_client(server_name)
+            tools = await client.list_tools()
+            for tool in tools:
+                # 转成 OpenAI function call 格式
+                definition = {
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("inputSchema", {
+                            "type": "object",
+                            "properties": {}
+                        })
+                    }
+                }
+                register_mcp_tool(tool["name"], server_name, definition)
+                print(f"  [MCP] 注册工具: {tool['name']} <- {server_name}")
+        except Exception as e:
+            print(f"  [MCP] 连接失败 ({server_name}): {e}")
+```
