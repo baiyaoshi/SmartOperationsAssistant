@@ -1,4 +1,4 @@
-from pydantic_settings import BaseSettings
+﻿from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     # LLM 配置
@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     dashscope_embedding_model: str = "text-embedding-v3"
     dashscope_embedding_dim: int = 1024
 
-    # Milvus
+    # milvus
     milvus_host: str = "127.0.0.1"
     milvus_port: int = 19530
     milvus_collection: str = "knowledge_base"
@@ -30,6 +30,16 @@ class Settings(BaseSettings):
     rag_rerank_enabled: bool = True
     rag_rerank_model: str = "gte-rerank-v2"
     rag_rerank_timeout_sec: int = 30
+    rag_chunk_size: int = 800                     # 文档分块大小 (字符)
+    rag_chunk_overlap: int = 100                  # 分块重叠大小 (字符)
+    rag_hybrid_bm25_weight: float = 0.4           # Hybrid 中 BM25 的权重
+
+    # 联网搜索
+    web_search_provider: str = "open_websearch"             # open_websearch / mock
+    open_websearch_base_url: str = "http://127.0.0.1:3210"
+    open_websearch_engine: str = "bing"
+    open_websearch_search_mode: str = "auto"
+    open_websearch_timeout_sec: float = 15.0
 
     model_config = {
         "env_file": ".env",

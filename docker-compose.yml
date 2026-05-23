@@ -36,7 +36,21 @@ services:
     volumes:
       - redis-data:/data
 
+  open-websearch:
+    build: ./open-webSearch-main
+    container_name: open-websearch
+    working_dir: /app
+    restart: unless-stopped
+    ports:
+      - "3210:3000"
+    environment:
+      NODE_ENV: production
+      DEFAULT_SEARCH_ENGINE: bing
+      ENABLE_CORS: "true"
+      CORS_ORIGIN: "*"
+      PORT: 3000
 volumes:
   milvus-minio-data:
   milvus-data:
   redis-data:
+

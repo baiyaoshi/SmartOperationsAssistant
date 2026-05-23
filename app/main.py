@@ -7,7 +7,7 @@ from pathlib import Path
 from app.tools.meta import get_all_tools
 from app.tools.mcp_loader import discover_and_register_mcp_tools
 from app.core.mcp_client import close_all
-from app.api.v1 import health, aiops  # 引入路由
+from app.api.v1 import health, aiops,knowledge    # 引入路由
 
 
 @asynccontextmanager
@@ -25,6 +25,7 @@ app = FastAPI(title="Smart Operations Assistant", lifespan=lifespan)
 # 注册路由
 app.include_router(health.router)
 app.include_router(aiops.router)
+app.include_router(knowledge.router)
 
 # 挂载前端
 BASE_DIR = Path(__file__).resolve().parent.parent
