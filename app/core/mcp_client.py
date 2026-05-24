@@ -9,7 +9,11 @@ MCP_SERVERS = {
     "system": {
         "url": "http://127.0.0.1:9001",
         "description": "系统诊断 (CPU/内存/磁盘/进程)"
-    }
+    },
+    "network": {
+            "url": "http://127.0.0.1:9002",
+            "description": "网络诊断 (ping/HTTP/DNS/端口)"
+        },
 }
 
 
