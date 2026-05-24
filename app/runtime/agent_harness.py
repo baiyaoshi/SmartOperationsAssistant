@@ -16,6 +16,7 @@ class AgentHarness:
     planner_model: str = "qwen-plus"     # Planner 用
     executor_model: str = "qwen-plus"    # Executor 用
     replanner_model: str = "qwen-plus"   # Replanner 用
+    rag_chat_model: str = "qwen-plus"  # RAG 聊天用
 
     # SkillRouter Prompt
     @property
@@ -53,6 +54,28 @@ class AgentHarness:
                 - is_finished: true=完成生成报告，false=继续执行
                 - plan: 剩余步骤列表（仅is_finished=false时有值）
                 - response: 最终报告（仅is_finished=true时有值）"""
+
+    # RAG Chat System Prompt
+    @property
+    def rag_system_prompt(self) -> str:
+        return """你是一个智能运维助手，根据知识库内容和联网搜索结果回答用户问题。
+   回答要求：
+   1. 如果知识库中有相关文档，优先基于知识库回答
+   2. 如果知识库中没有相关内容，根据自己的知识回答
+   3. 引用知识库内容时，在回答末尾注明来源
+   4. 回答要简洁、准确、有条理"""
+
+    # RAG Chat User Prompt
+    @property
+    def rag_user_prompt(self) -> str:
+        return """对话历史：
+               {history}
+               知识库检索结果：
+               {context}
+               联网搜索结果：
+               {web_context}
+               用户问题：{question}
+               请根据以上信息回答用户问题。"""
 
 
 # 全局单例

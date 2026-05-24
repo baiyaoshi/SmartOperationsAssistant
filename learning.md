@@ -2968,3 +2968,413 @@ Agent 遇到一个问题（比如"Redis 连接超时"），它会：
 
 - 按 `rag_chunk_size=800` 切段
 - 相邻段有 `rag_chunk_overlap=100` 字重叠，防止关键句子被切在边缘上
+
+
+
+### 创建rag聊天
+
+rag_service.py
+
+```py
+"""RAG 聊天服务
+
+把知识库检索 + 联网搜索 + LLM 生成串成 SSE 事件流。
+调用方（api/v1/chat.py）消费这个流推给前端。
+"""
+
+from __future__ import annotations
+
+import time
+from typing import Any, AsyncIterator
+
+from app.core.llm import client
+from app.runtime.agent_harness import get_agent_harness
+from app.services.rag.retrieval import build_context
+from app.services.rag.web_context import build_web_context
+from app.services.rag.memory import rewrite_question
+from app.services.rag.utils import format_history
+import app.services.chat_memory as chat_memory
+
+harness = get_agent_harness()
+
+
+async def stream_chat(
+    question: str,
+    *,
+    session_id: str = "default",
+    top_k: int = 3,
+    web_search: bool = False,
+) -> AsyncIterator[dict]:
+    """流式 RAG 聊天, yield 事件字典
+
+    事件类型:
+      - {"type": "progress", "stage": ..., "label": ..., "detail": ...}
+      - {"type": "token", "content": "..."}
+      - {"type": "end"}
+      - {"type": "error", "message": "..."}
+    """
+    total_t0 = time.perf_counter()
+
+    def progress(stage: str, label: str, detail: str = "") -> dict:
+        return {
+            "type": "progress",
+            "stage": stage,
+            "label": label,
+            "detail": detail,
+        }
+
+    # ── Stage 1: 读取历史记忆 ──
+    history = await chat_memory.get_messages(session_id)
+    if history:
+        history_text = format_history(history[-6:])  # 取最近 6 条
+    else:
+        history_text = "(无)"
+
+    # ── Stage 2: Query 改写 ──
+    rewritten = await rewrite_question(question, recent_messages=history[-4:] if history else [])
+    if rewritten != question:
+        yield progress("rewrite", "查询改写", f"{question} → {rewritten}")
+
+    # ── Stage 3: 知识库检索 ──
+    yield progress("retrieve", "正在检索知识库", f"top_k={top_k}")
+    context, hits, sources, hits_meta = await build_context(rewritten, top_k)
+    if hits > 0:
+        yield progress("retrieve_done", f"检索完成, 命中 {hits} 个片段", ", ".join(sources[:3]))
+    else:
+        yield progress("retrieve_done", "知识库未命中相关内容", "")
+
+    # ── Stage 4: 联网搜索（可选）──
+    web_context = ""
+    web_sources = []
+    if web_search:
+        yield progress("web", "正在联网补充资料", "")
+        try:
+            web_context, web_sources, web_hits, skip_reason = await build_web_context(
+                rewritten, enabled=True
+            )
+            if web_hits:
+                yield progress("web_done", f"联网补充完成 ({len(web_hits)} 条)", "")
+            else:
+                yield progress("web_done", "联网搜索未找到相关结果", skip_reason)
+        except Exception as e:
+            yield progress("web_done", f"联网搜索失败: {type(e).__name__}", str(e))
+            web_context = ""
+            web_sources = []
+
+    # ── Stage 5: 构造 Prompt ──
+    system_prompt = harness.rag_system_prompt
+    user_prompt = harness.rag_user_prompt.format(
+        context=context,
+        web_context=web_context or "(未启用联网搜索)",
+        history=history_text,
+        question=question,
+    )
+
+    yield progress("llm", "模型正在生成回答", "")
+
+    # ── Stage 6: LLM 流式生成 ──
+    full_answer = ""
+    input_tokens = output_tokens = 0
+    llm_t0 = time.perf_counter()
+
+    try:
+        resp = await client.chat.completions.create(
+            model=harness.rag_chat_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+
+        async for chunk in resp:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta and delta.content:
+                full_answer += delta.content
+                yield {"type": "token", "content": delta.content}
+
+            usage = chunk.usage
+            if usage:
+                input_tokens = usage.prompt_tokens or input_tokens
+                output_tokens = usage.completion_tokens or output_tokens
+
+    except Exception as e:
+        yield {"type": "error", "message": f"LLM 调用失败: {type(e).__name__}: {e}"}
+        return
+
+    # ── 收尾: 写记忆 ──
+    try:
+        await chat_memory.append_message(session_id, role="user", content=question)
+        await chat_memory.append_message(session_id, role="assistant", content=full_answer)
+    except Exception as e:
+        print(f"[rag_service] 记忆写入失败: {e}")
+
+    llm_ms = int((time.perf_counter() - llm_t0) * 1000)
+    total_ms = int((time.perf_counter() - total_t0) * 1000)
+
+    yield {
+        "type": "stats",
+        "data": {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": input_tokens + output_tokens,
+            "llm_ms": llm_ms,
+            "total_ms": total_ms,
+        },
+    }
+    yield {"type": "end"}
+```
+
+核心函数 `stream_chat()`，接收用户问题，按阶段 yield 事件：
+
+1. **Stage 1** — 读取 Redis 中的历史记忆
+2. **Stage 2** — Query 改写（用历史上下文补全指代）
+3. **Stage 3** — 知识库检索（调用 `build_context`）
+4. **Stage 4** — 联网搜索（可开关，默认关闭）
+5. **Stage 5** — 构造 prompt（system + user）
+6. **Stage 6** — LLM 流式生成（用 `client.chat.completions.create(stream=True)`）
+7. **收尾** — 写回记忆 + 输出 token 统计
+
+整体结构
+
+```python
+async def stream_chat(
+    question: str,
+    *,
+    session_id: str = "default",
+    top_k: int = 3,
+    web_search: bool = False,
+) -> AsyncIterator[dict]:
+```
+
+- `async def` — 因为里面要 `await` 各种异步操作（查 Redis、检索知识库、调 LLM）
+- `stream_chat` — 名字表明这是**流式**聊天，不是一次性返回
+- `-> AsyncIterator[dict]` — 返回值类型：一个异步迭代器，每次 yield 一个字典事件
+- `question` — 用户问题
+- `session_id` — 会话 ID，用来在 Redis 里存取历史
+- `top_k` — 知识库返回多少条片段
+- `web_search` — 是否开启联网搜索
+
+每个阶段的代码
+
+1. 准备工作
+
+```python
+total_t0 = time.perf_counter()
+
+def progress(stage: str, label: str, detail: str = "") -> dict:
+    return {
+        "type": "progress",
+        "stage": stage,
+        "label": label,
+        "detail": detail,
+    }
+```
+
+| 代码                | 为什么这么写                                                 |
+| ------------------- | ------------------------------------------------------------ |
+| time.perf_counter() | 记录开始时间，后面算总耗时。perf_counter比time.time()精度更高 |
+| def progress(...)   | 一个辅助函数，生成"进度事件"字典。每个事件有 type/stage/label/detail 四个字段，前端根据 type=progress 展示 |
+
+2. Stage 1：读取历史
+
+```python
+history = await chat_memory.get_messages(session_id)
+if history:
+    history_text = format_history(history[-6:])
+else:
+    history_text = "(无)"
+```
+
+| 代码                                       | 为什么这么写                                     |
+| ------------------------------------------ | ------------------------------------------------ |
+| await chat_memory.get_messages(session_id) | 从 Redis 取这个 session 的历史消息（返回列表）   |
+| history[-6:]                               | 只取最近 6 条，防止历史太长塞爆 prompt           |
+| format_history(...)                        | 把 [{role, content}] 格式转成可读文本，给 LLM 看 |
+
+3. Stage 2：Query 改写
+
+```python
+rewritten = await rewrite_question(question, recent_messages=history[-4:] if history else [])
+if rewritten != question:
+    yield progress("rewrite", "查询改写", f"{question} → {rewritten}")
+```
+
+| 代码                      | 为什么这么写                                                 |
+| ------------------------- | ------------------------------------------------------------ |
+| rewrite_question(...)     | 如果用户说"那是什么"，需要结合上一条问题（比如"CPU使用率"）改写成"CPU使用率是什么" |
+| history[-4:]              | 取最近 4 条消息作为上下文就够了                              |
+| if rewritten != question: | 只有真正改写了才发进度事件，没改写就不发                     |
+| yield progress(...)       | yield 一个进度事件给前端展示                                 |
+
+4. Stage 3：知识库检索
+
+```python
+yield progress("retrieve", "正在检索知识库", f"top_k={top_k}")
+context, hits, sources, hits_meta = await build_context(rewritten, top_k)
+if hits > 0:
+    yield progress("retrieve_done", f"检索完成, 命中 {hits} 个片段", ", ".join(sources[:3]))
+else:
+    yield progress("retrieve_done", "知识库未命中相关内容", "")
+```
+
+| 代码                                  | 为什么这么写                                                 |
+| ------------------------------------- | ------------------------------------------------------------ |
+| yield progress("retrieve", ...)       | 先告诉前端"开始检索了"                                       |
+| await build_context(rewritten, top_k) | 调用 retrieval.py 的 build_context，它里面走的是 advanced_search（向量 → hybrid → rerank） |
+| context                               | 检索到的文档正文（字符串）                                   |
+| hits                                  | 命中数量                                                     |
+| sources                               | 来源列表（文件名）                                           |
+| hits_meta                             | 每条命中的元信息（来源、章节、预览、分数）                   |
+| sources[:3]                           | 前端展示时只取前 3 个来源，太多放不下                        |
+| yield progress("retrieve_done", ...)  | 告诉前端检索完成了                                           |
+
+5. Stage 4：联网搜索
+
+```python
+web_context = ""
+web_sources = []
+if web_search:
+    yield progress("web", "正在联网补充资料", "")
+    try:
+        web_context, web_sources, web_hits, skip_reason = await build_web_context(
+            rewritten, enabled=True
+        )
+        if web_hits:
+            yield progress("web_done", f"联网补充完成 ({len(web_hits)} 条)", "")
+        else:
+            yield progress("web_done", "联网搜索未找到相关结果", skip_reason)
+    except Exception as e:
+        yield progress("web_done", f"联网搜索失败: {type(e).__name__}", str(e))
+        web_context = ""
+        web_sources = []
+```
+
+| 代码                         | 为什么这么写                                               |
+| ---------------------------- | ---------------------------------------------------------- |
+| if web_search:               | 只有前端传了 web_search=True 才联网，默认不搜（省钱）      |
+| await build_web_context(...) | 调用 web_context.py 去搜索并拼成文本                       |
+| try...except                 | 联网可能超时或失败，不能让整个聊天崩溃，捕获异常后降级为空 |
+| type(e).__name__             | 只显示异常类型名（如 TimeoutException），不暴露内部细节    |
+
+6. Stage 5：构造 Prompt
+
+```python
+system_prompt = harness.rag_system_prompt
+user_prompt = harness.rag_user_prompt.format(
+    context=context,
+    web_context=web_context or "(未启用联网搜索)",
+    history=history_text,
+    question=question,
+)
+```
+
+| 代码                                | 为什么这么写                               |
+| ----------------------------------- | ------------------------------------------ |
+| harness.rag_system_prompt           | 从 AgentHarness 取 system prompt，统一管理 |
+| harness.rag_user_prompt.format(...) | 用 format 把变量填进模板里                 |
+| context                             | 知识库检索结果                             |
+| web_context                         | 联网搜索结果                               |
+| history                             | 历史对话                                   |
+| question                            | 用户当前问题                               |
+
+7. Stage 6：LLM 流式生成
+
+```python
+yield progress("llm", "模型正在生成回答", "")
+
+full_answer = ""
+input_tokens = output_tokens = 0
+llm_t0 = time.perf_counter()
+
+try:
+    resp = await client.chat.completions.create(
+        model=harness.rag_chat_model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        stream=True,
+        stream_options={"include_usage": True},
+    )
+
+    async for chunk in resp:
+        delta = chunk.choices[0].delta if chunk.choices else None
+        if delta and delta.content:
+            full_answer += delta.content
+            yield {"type": "token", "content": delta.content}
+
+        usage = chunk.usage
+        if usage:
+            input_tokens = usage.prompt_tokens or input_tokens
+            output_tokens = usage.completion_tokens or output_tokens
+
+except Exception as e:
+    yield {"type": "error", "message": f"LLM 调用失败: {type(e).__name__}: {e}"}
+    return
+```
+
+| 代码                                              | 为什么这么写                                                 |
+| ------------------------------------------------- | ------------------------------------------------------------ |
+| client.chat.completions.create(...)               | 调用 LLM API，client 是 app/core/llm.py 里的全局 AsyncOpenAI 客户端 |
+| model=harness.rag_chat_model                      | 从 Harness 拿模型名，方便切换                                |
+| stream=True                                       | 流式返回，不然要等全部生成完才能展示                         |
+| stream_options={"include_usage": True}            | 让 API 返回 token 用量信息                                   |
+| async for chunk in resp:                          | 逐块读取流式返回                                             |
+| chunk.choices[0].delta                            | 每个块里有 choices[0].delta，delta.content 就是新生成的一段文字 |
+| yield {"type": "token", "content": delta.content} | 每收到一段文字就 yield 给前端，前端实时追加显示              |
+| chunk.usage                                       | 最后一个块会带 usage 信息（整个请求的 token 统计）           |
+| except Exception                                  | LLM 调用可能失败（网络/API key 错误），不能让整个服务崩溃    |
+
+8. 收尾：写记忆
+
+```python
+try:
+    await chat_memory.append_message(session_id, role="user", content=question)
+    await chat_memory.append_message(session_id, role="assistant", content=full_answer)
+except Exception as e:
+    print(f"[rag_service] 记忆写入失败: {e}")
+```
+
+| 代码                        | 为什么这么写                                             |
+| --------------------------- | -------------------------------------------------------- |
+| append_message(role="user") | 把用户问题和助手回答都存进 Redis                         |
+| role="assistant"            | 注意拼写是 assistant 不是 assistant（LLM 的 convention） |
+| try...except                | Redis 可能连不上，不能因为记忆写入失败影响用户体验       |
+
+9. 输出统计信息
+
+```python
+llm_ms = int((time.perf_counter() - llm_t0) * 1000)
+total_ms = int((time.perf_counter() - total_t0) * 1000)
+
+yield {
+    "type": "stats",
+    "data": {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "llm_ms": llm_ms,
+        "total_ms": total_ms,
+    },
+}
+yield {"type": "end"}
+```
+
+| 代码                           | 为什么这么写                |
+| ------------------------------ | --------------------------- |
+| time.perf_counter() - llm_t0   | 算 LLM 生成耗时（毫秒）     |
+| time.perf_counter() - total_t0 | 算整个请求总耗时            |
+| yield {"type": "stats"}        | 把 token 和耗时发给前端展示 |
+| yield {"type": "end"}          | 告诉前端流结束了            |
+
+事件类型总结
+
+| type     | 含义               | 前端处理            |
+| -------- | ------------------ | ------------------- |
+| progress | 阶段进度           | 显示 label 文字     |
+| token    | LLM 输出的一段文字 | 追加到助手气泡      |
+| stats    | 统计信息           | 显示 token 数和耗时 |
+| error    | 错误信息           | 显示错误提示        |
+| end      | 流结束             | 停止接收            |
