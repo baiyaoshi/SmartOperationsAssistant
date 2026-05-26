@@ -132,8 +132,9 @@
 </head>
 <body>
     <div class="header">
-        📚 RAG 知识库问答
-        <a href="/frontend">← 返回诊断页面</a>
+        💬 RAG 知识库问答
+        <a href="javascript:void(0)" onclick="location.href='/frontend/index.html?session_id='+localStorage.getItem('diagnosis_session_id')">← 诊断</a>
+        <a href="/frontend/knowledge.html">📚 知识库</a>
     </div>
     <div class="container">
         <div id="output"></div>
@@ -148,13 +149,39 @@
         const input = document.getElementById('input');
         const btn = document.getElementById('btn');
 
+        // 优先从 URL 读 session_id，没有则从 localStorage 生成
         const urlParams = new URLSearchParams(window.location.search);
         let sessionId = urlParams.get('session_id');
         if (!sessionId) {
-            sessionId = 'rag_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
-            const newUrl = window.location.pathname + '?session_id=' + sessionId;
-            window.history.replaceState({}, '', newUrl);
+            sessionId = localStorage.getItem('rag_session_id');
         }
+        if (!sessionId) {
+            sessionId = 'rag_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+        }
+        localStorage.setItem('rag_session_id', sessionId);
+
+        // 从后端 Redis 加载历史记录
+        async function loadHistory() {
+            try {
+                const resp = await fetch('/api/v1/agent/history/' + sessionId);
+                if (!resp.ok) return;
+                const data = await resp.json();
+                if (!data.messages || data.messages.length === 0) return;
+                for (const msg of data.messages) {
+                    const text = (msg.content || '').trim();
+                    if (!text) continue;
+                    const row = document.createElement('div');
+                    row.className = 'msg-row msg-' + (msg.role === 'user' ? 'user' : 'assistant');
+                    const bubble = document.createElement('div');
+                    bubble.className = 'msg-bubble';
+                    bubble.textContent = text;
+                    row.appendChild(bubble);
+                    output.appendChild(row);
+                }
+                output.scrollTop = output.scrollHeight;
+            } catch(e) {}
+        }
+        loadHistory();
 
         function addMessage(role, text) {
             const row = document.createElement('div');

@@ -84,3 +84,10 @@ async def graph_demo_memory_stream(request: ChatRequest):
         graph_memory_stream_response(request.message, request.session_id),
         media_type="text/event-stream"
     )
+
+
+@router.get("/api/v1/agent/history/{session_id}")
+async def get_session_history(session_id: str):
+    """获取 session 的诊断历史记录"""
+    messages = await chat_memory.get_messages(session_id)
+    return {"session_id": session_id, "messages": messages}

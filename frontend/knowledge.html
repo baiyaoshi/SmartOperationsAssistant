@@ -146,8 +146,8 @@
 <body>
     <div class="header">
         📚 知识库管理
-        <a href="/frontend">← 返回诊断页面</a>
-        <a href="/frontend/chat.html">RAG 聊天 →</a>
+        <a href="javascript:void(0)" onclick="location.href='/frontend/index.html?session_id='+localStorage.getItem('diagnosis_session_id')">← 诊断</a>
+        <a href="javascript:void(0)" onclick="location.href='/frontend/chat.html?t='+Date.now()">💬 聊天</a>
     </div>
     <div class="container">
         <!-- 上传区域 -->
