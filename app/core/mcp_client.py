@@ -14,6 +14,10 @@ MCP_SERVERS = {
             "url": "http://127.0.0.1:9002",
             "description": "网络诊断 (ping/HTTP/DNS/端口)"
         },
+    "docker": {
+        "url": "http://127.0.0.1:9003",
+        "description": "Docker 容器诊断 (ps/stats/logs/inspect)"
+    },
 }
 
 
