@@ -3378,3 +3378,60 @@ yield {"type": "end"}
 | stats    | 统计信息           | 显示 token 数和耗时 |
 | error    | 错误信息           | 显示错误提示        |
 | end      | 流结束             | 停止接收            |
+
+
+
+### 一些方法
+
+```
+def _run_docker(args: list, timeout: int = 15) -> tuple[str, str, int]:
+    try:
+        proc = subprocess.run(
+            ["docker", *args],      # ← 这里
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return proc.stdout or "", proc.stderr or "", proc.returncode
+    except ...
+```
+
+当你调用：
+
+```python
+_run_docker(["ps", "-a", "--format", "{{json .}}"])
+```
+
+实际执行的是：
+
+```python
+subprocess.run(
+    ["docker", "ps", "-a", "--format", "{{json .}}"],
+    ...
+)
+```
+
+也就是在命令行里执行：
+
+```powershell
+docker ps -a --format "{{json .}}"
+```
+
+### 这个命令在 cmd 里执行的效果
+
+```powershell
+docker ps -a --format "{{json .}}"
+```
+
+输出示例（每行一个 JSON）：
+
+```json
+{"Names":"my_milvus","Image":"milvusdb/milvus:v2.4.1","Status":"Up 3 days","Ports":"0.0.0.0:19530->19530/tcp"}
+{"Names":"my_redis","Image":"redis:7","Status":"Up 3 days","Ports":"0.0.0.0:6379->6379/tcp"}
+```
+
+`stdout, stderr, code = _run_docker(...)` 是什么？
+
+接受三个返回值

@@ -1,0 +1,5 @@
+[mcp] docker_server Æô¶¯ÔÚ http://127.0.0.1:9003/sse ...
+INFO:     127.0.0.1:11226 - "GET /sse HTTP/1.1" 200 OK
+INFO:     127.0.0.1:11227 - "POST /messages/?session_id=3abdfb64a8a440f48d5bd67269a86031 HTTP/1.1" 202 Accepted
+INFO:     127.0.0.1:11227 - "POST /messages/?session_id=3abdfb64a8a440f48d5bd67269a86031 HTTP/1.1" 202 Accepted
+INFO:     127.0.0.1:11227 - "POST /messages/?session_id=3abdfb64a8a440f48d5bd67269a86031 HTTP/1.1" 202 Accepted

@@ -1,0 +1,4 @@
+INFO:     127.0.0.1:11222 - "GET /sse HTTP/1.1" 200 OK
+INFO:     127.0.0.1:11223 - "POST /messages/?session_id=9b9e56cef0754911bbee8673bfb44081 HTTP/1.1" 202 Accepted
+INFO:     127.0.0.1:11223 - "POST /messages/?session_id=9b9e56cef0754911bbee8673bfb44081 HTTP/1.1" 202 Accepted
+INFO:     127.0.0.1:11223 - "POST /messages/?session_id=9b9e56cef0754911bbee8673bfb44081 HTTP/1.1" 202 Accepted
